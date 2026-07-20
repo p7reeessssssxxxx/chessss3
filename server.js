@@ -96,6 +96,30 @@ async function analyze(fen, depth) {
 const sessions = new Map(); // token -> { fen, bestmove, cp, mate, pv, updatedAt }
 const viewers = new Map();  // token -> Set<ws>
 
+// ---- free-trial enforcement (server-authoritative, keyed by Roblox UserId) ----
+// Counts GAMES via start-position transitions in the pushed FENs. The client cannot bypass:
+// state lives here, survives client restarts, and is tied to the UserId (not an editable local).
+const fs = require('fs');
+const TRIAL_FILE = process.env.TRIAL_FILE || '/tmp/oxy_chess_trials.json';
+const FREE_PLAYS = parseInt(process.env.FREE_PLAYS || '5', 10);
+const FREE_WINDOW_MS = parseFloat(process.env.FREE_WINDOW_H || '6') * 3600 * 1000;
+const START_PLACEMENT = 'rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR';
+const trials = new Map(); // userId(string) -> { plays, resetAt, lastStart }
+try { const j = JSON.parse(fs.readFileSync(TRIAL_FILE, 'utf8')); for (const k in j) trials.set(k, j[k]); } catch (_) {}
+let _saveT = null;
+function saveTrials() {
+  if (_saveT) return;
+  _saveT = setTimeout(() => { _saveT = null;
+    try { const o = {}; for (const [k, v] of trials) o[k] = v; fs.writeFileSync(TRIAL_FILE, JSON.stringify(o)); } catch (_) {}
+  }, 1500);
+}
+function trialFor(userId) {
+  const now = Date.now();
+  let t = trials.get(userId);
+  if (!t || now >= (t.resetAt || 0)) { t = { plays: FREE_PLAYS, resetAt: now + FREE_WINDOW_MS, lastStart: false }; trials.set(userId, t); saveTrials(); }
+  return t;
+}
+
 setInterval(() => {
   const now = Date.now();
   for (const [t, rec] of sessions) if (now - rec.updatedAt > SESSION_TTL_MS && !(viewers.get(t) || {}).size) sessions.delete(t);
@@ -122,15 +146,32 @@ app.use(express.json({ limit: '16kb' }));
 app.get('/', (_req, res) => res.type('text').send('oxy chess relay up'));
 
 app.post('/push', async (req, res) => {
-  const { token, fen } = req.body || {};
+  const { token, fen, userId, tier } = req.body || {};
   if (!validToken(token) || !validFen(fen)) return res.status(400).json({ error: 'bad token/fen' });
+
+  // free-trial gate — server counts games and locks free users after FREE_PLAYS (resets after 6h)
+  let playsLeft = null;
+  const isFree = (tier !== 'paid' && tier !== 'paidplus');
+  if (isFree && userId != null && /^\d{1,20}$/.test(String(userId))) {
+    const t = trialFor(String(userId));
+    const isStart = fen.startsWith(START_PLACEMENT);
+    if (isStart && t.lastStart === false) { t.plays = Math.max(0, t.plays - 1); saveTrials(); }
+    if (t.lastStart !== isStart) { t.lastStart = isStart; saveTrials(); }
+    playsLeft = t.plays;
+    if (t.plays <= 0) {
+      const rec = { fen, locked: true, playsLeft: 0, resetAt: t.resetAt, updatedAt: Date.now() };
+      sessions.set(token, rec); broadcast(token, rec);
+      return res.json({ locked: true, playsLeft: 0, resetAt: t.resetAt });
+    }
+  }
+
   const prev = sessions.get(token);
-  if (prev && prev.fen === fen && prev.bestmove) return res.json({ ok: true, cached: true });
+  if (prev && prev.fen === fen && prev.bestmove) return res.json({ ok: true, cached: true, playsLeft });
   // record the raw fen immediately so the viewer flips instantly; analysis fills in
   const rec = { fen, bestmove: null, cp: null, mate: null, pv: null, updatedAt: Date.now() };
   sessions.set(token, rec);
   broadcast(token, rec);
-  res.json({ ok: true });
+  res.json({ ok: true, playsLeft });
   try {
     const r = await analyze(fen, DEPTH);
     const cur = sessions.get(token);
